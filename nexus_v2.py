@@ -270,6 +270,17 @@ class NexusDatabase:
         self._init_db()
 
     def _init_db(self):
+        # Crée le dossier parent si le chemin configuré en pointe un qui n'existe
+        # pas (ex: NEXUS_DB_PATH mal réglé sur un disque non attaché). Évite un
+        # crash total au démarrage pour une simple erreur de configuration.
+        parent = os.path.dirname(os.path.abspath(self.db_path))
+        if parent and not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as e:
+                print(f"[db] impossible de créer le dossier '{parent}' ({e}) — "
+                      f"repli sur 'nexus.db' dans le dossier courant")
+                self.db_path = "nexus.db"
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS users (
