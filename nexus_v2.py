@@ -31,22 +31,154 @@ UTILISATION API:
 
 import sqlite3
 import os
+import sys
 import json
 import hashlib
 import random
 import secrets
 import threading
 import time
+import base64
+import signal
+import atexit
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import Counter, defaultdict, deque
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 DB_PATH = os.environ.get("NEXUS_DB_PATH", "nexus.db")
+
+# ============================================================
+# SAUVEGARDE / RESTAURATION VIA GIST GITHUB PRIVÉ
+# ============================================================
+# Contourne l'absence de disque persistant sur Render (plan gratuit) : à
+# chaque redéploiement, le système de fichiers repart de zéro. On restaure
+# donc la base depuis un Gist privé au démarrage, et on la ré-uploade
+# périodiquement + juste avant l'arrêt (SIGTERM envoyé par Render au moment
+# du redéploiement).
+#
+# Limite assumée : toute donnée écrite entre la dernière sauvegarde et un
+# arrêt brutal (crash, kill -9, coupure réseau pendant le SIGTERM) est perdue.
+# Ce n'est pas un vrai substitut à un disque persistant ou une vraie base
+# managée (Postgres) — c'est un filet de sécurité pour un usage à faible
+# enjeu, pas une garantie de durabilité.
+
+GITHUB_API = "https://api.github.com"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_GIST_ID = os.environ.get("GITHUB_GIST_ID")
+GIST_BACKUP_FILENAME = "nexus_db_backup.b64"
+BACKUP_INTERVAL_SECONDS = int(os.environ.get("BACKUP_INTERVAL_SECONDS", "300"))
+
+
+def backup_enabled():
+    return bool(REQUESTS_AVAILABLE and GITHUB_TOKEN and GITHUB_GIST_ID)
+
+
+def _gist_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def backup_db_to_gist(db_path=None, timeout=15):
+    """
+    Encode la base SQLite en base64 et l'envoie dans le Gist configuré.
+    Ne lève jamais d'exception : un échec de sauvegarde ne doit jamais
+    faire planter le serveur. Retourne True/False.
+    """
+    path = db_path or DB_PATH
+    if not backup_enabled():
+        return False
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        resp = requests.patch(
+            f"{GITHUB_API}/gists/{GITHUB_GIST_ID}",
+            headers=_gist_headers(),
+            json={"files": {GIST_BACKUP_FILENAME: {"content": encoded}}},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            return True
+        print(f"[backup] échec sauvegarde Gist : HTTP {resp.status_code} — {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[backup] erreur sauvegarde Gist : {e}")
+        return False
+
+
+def restore_db_from_gist(db_path=None, timeout=15):
+    """
+    Télécharge la dernière sauvegarde depuis le Gist et l'écrit sur disque.
+    Ne fait rien si un fichier local existe déjà (ne jamais écraser une base
+    qui aurait par ailleurs survécu). Retourne True/False, ne lève jamais.
+    """
+    path = db_path or DB_PATH
+    if not backup_enabled():
+        return False
+    if os.path.exists(path):
+        return False
+    try:
+        resp = requests.get(f"{GITHUB_API}/gists/{GITHUB_GIST_ID}", headers=_gist_headers(), timeout=timeout)
+        if resp.status_code != 200:
+            print(f"[restore] échec lecture Gist : HTTP {resp.status_code}")
+            return False
+        files = resp.json().get("files", {})
+        file_info = files.get(GIST_BACKUP_FILENAME)
+        content = file_info.get("content") if file_info else None
+        if not content or content.startswith("placeholder"):
+            print("[restore] aucune sauvegarde exploitable dans le Gist (premier démarrage ?)")
+            return False
+        raw = base64.b64decode(content)
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw)
+        print(f"[restore] base restaurée depuis le Gist ({len(raw)} octets)")
+        return True
+    except Exception as e:
+        print(f"[restore] erreur restauration Gist : {e}")
+        return False
+
+
+def _periodic_backup_loop():
+    while True:
+        time.sleep(BACKUP_INTERVAL_SECONDS)
+        backup_db_to_gist()
+
+
+def start_backup_thread():
+    if not backup_enabled():
+        print("[backup] désactivé (GITHUB_TOKEN / GITHUB_GIST_ID absents) — la base ne survivra pas à un redéploiement")
+        return
+    t = threading.Thread(target=_periodic_backup_loop, daemon=True)
+    t.start()
+    print(f"[backup] sauvegarde automatique activée (toutes les {BACKUP_INTERVAL_SECONDS}s)")
+
+
+def _handle_shutdown_signal(signum, frame):
+    print("[backup] signal d'arrêt reçu, sauvegarde finale avant coupure...")
+    backup_db_to_gist()
+    sys.exit(0)
+
+
+def register_shutdown_backup():
+    if not backup_enabled():
+        return
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    atexit.register(backup_db_to_gist)
+
 
 # ============================================================
 # STRUCTURES DE DONNÉES
@@ -668,8 +800,16 @@ if FLASK_AVAILABLE:
             response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
             return response
 
+    # Avant toute chose : si une sauvegarde existe sur le Gist et qu'aucun
+    # fichier local n'est présent (cas typique après un redéploiement sur
+    # Render sans disque persistant), on la restaure.
+    restore_db_from_gist()
+
     db = NexusDatabase()
     nexus_instances = {}
+
+    start_backup_thread()
+    register_shutdown_backup()
 
     # Limites : par utilisateur authentifié (endpoints normaux), par IP pour
     # /register (empêcher la création massive de comptes), et par IP sur les
@@ -796,7 +936,21 @@ if FLASK_AVAILABLE:
 
     @app.route('/api/v1/health', methods=['GET'])
     def health_check():
-        return jsonify({'status': 'healthy', 'service': 'NEXUS API v2.0', 'version': '2.0.0'})
+        return jsonify({
+            'status': 'healthy', 'service': 'NEXUS API v2.0', 'version': '2.0.0',
+            'backup_enabled': backup_enabled()
+        })
+
+    @app.route('/api/v1/backup/now', methods=['POST'])
+    def trigger_backup():
+        # Volontairement protégé par une clé API valide (n'importe laquelle) plutôt
+        # que laissé ouvert : évite qu'un tiers déclenche des sauvegardes à volonté.
+        user_id, err, code = require_auth()
+        if err: return err, code
+        if not backup_enabled():
+            return jsonify({'status': 'error', 'message': 'sauvegarde désactivée (GITHUB_TOKEN / GITHUB_GIST_ID absents)'}), 400
+        ok = backup_db_to_gist()
+        return jsonify({'status': 'success' if ok else 'error', 'backed_up': ok})
 
     @app.errorhandler(404)
     def not_found(e):
