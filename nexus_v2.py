@@ -31,6 +31,7 @@ UTILISATION API:
 
 import sqlite3
 import os
+import re
 import sys
 import json
 import hashlib
@@ -57,6 +58,23 @@ except ImportError:
 # ============================================================
 
 DB_PATH = os.environ.get("NEXUS_DB_PATH", "nexus.db")
+
+
+def parse_iso_naive(date_string):
+    """
+    Parse une date ISO 8601 et retourne toujours un datetime "naïf" (sans
+    fuseau horaire), pour rester comparable avec datetime.now() utilisé
+    partout ailleurs dans le code.
+
+    Nécessaire car les navigateurs envoient souvent des dates avec un
+    suffixe 'Z' ou un offset explicite (ex: via Date.toISOString() en JS),
+    ce qui produit un datetime "conscient du fuseau" — le comparer
+    directement à datetime.now() (naïf) lève un TypeError.
+    """
+    dt = datetime.fromisoformat(date_string)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
 
 # ============================================================
 # SAUVEGARDE / RESTAURATION VIA GIST GITHUB PRIVÉ
@@ -181,6 +199,33 @@ def register_shutdown_backup():
 
 
 # ============================================================
+# UTILITAIRES TEXTE — partagés par le lexique adaptatif et le moteur
+# d'anticipation par motifs (voir plus bas)
+# ============================================================
+
+_STOPWORDS = {
+    'le','la','les','un','une','des','de','du','et','ou','à','au','aux','en',
+    'ce','ces','cet','cette','que','qui','quoi','dont','pour','par','sur',
+    'avec','sans','pas','plus','moins','très','ça','se','son','sa','ses',
+    'je','tu','il','elle','on','nous','vous','ils','elles','est','sont',
+    'the','a','an','of','to','in','on','for','and','or','is','are','it',
+    'this','that','be','have','has','was','were','i','you','he','she','we',
+}
+
+def tokenize(text):
+    """Tokenisation simple : minuscules, mots de 3+ lettres, stopwords retirés."""
+    words = re.findall(r"[a-zàâäéèêëïîôöùûüç]+", (text or "").lower())
+    return {w for w in words if len(w) >= 3 and w not in _STOPWORDS}
+
+def jaccard(set_a, set_b):
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return inter / union if union else 0.0
+
+
+# ============================================================
 # STRUCTURES DE DONNÉES
 # ============================================================
 
@@ -300,6 +345,22 @@ class NexusDatabase:
             log_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, timestamp TEXT NOT NULL,
             reasoning TEXT, decision TEXT NOT NULL, confidence REAL,
             outcome TEXT, user_feedback TEXT)''')
+        # Lexique adaptatif : poids appris par mot à partir des approbations/rejets
+        # réels de l'utilisateur, en complément (pas en remplacement) des listes de
+        # mots-clés statiques. category = 'urgency' ou 'emotion:<tone>'.
+        c.execute('''CREATE TABLE IF NOT EXISTS word_feedback (
+            user_id TEXT NOT NULL, word TEXT NOT NULL, category TEXT NOT NULL,
+            pos INTEGER DEFAULT 0, neg INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, word, category))''')
+        # Motifs précurseurs : associe un ensemble de mots significatifs (issus
+        # d'un signal ayant mené à une action) au type d'action qui a suivi, avec
+        # le nombre d'occurrences et le nombre de fois où l'action a été approuvée.
+        # C'est ce qui permet d'anticiper sur un signal qui RESSEMBLE à un motif
+        # passé, même sans mot-clé explicite (deadline, "urgent", etc.).
+        c.execute('''CREATE TABLE IF NOT EXISTS precursor_patterns (
+            user_id TEXT NOT NULL, signature TEXT NOT NULL, action_type TEXT NOT NULL,
+            occurrences INTEGER DEFAULT 0, hits INTEGER DEFAULT 0, last_seen TEXT,
+            PRIMARY KEY (user_id, signature, action_type))''')
         conn.commit(); conn.close()
 
     def _hash_key(self, api_key):
@@ -414,6 +475,80 @@ class NexusDatabase:
         types = dict(c.fetchall()); conn.close()
         return {'total_actions':total,'executed_actions':executed,'approval_rate':f"{executed/max(total,1):.1%}",'action_types':types}
 
+    def get_action_full(self, user_id, action_id):
+        """Version complète de get_action : renvoie tout ce qu'il faut pour
+        apprendre d'une décision (approve/reject), y compris après un
+        redémarrage où l'action n'est plus en mémoire (pending_approvals)."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("""SELECT action_type, target_context_json, priority, status
+                     FROM actions WHERE action_id=? AND user_id=?""", (action_id, user_id))
+        r = c.fetchone(); conn.close()
+        if not r: return None
+        return {'action_type': r[0], 'target_context': json.loads(r[1]) if r[1] else {},
+                'priority': r[2], 'status': r[3]}
+
+    def get_approval_stats(self, user_id, action_type, priority):
+        """Historique réel d'approbation pour un (type d'action, priorité) donné,
+        limité aux actions qui exigeaient une approbation humaine (on ne calibre
+        pas sur les digests auto-exécutés, qui ne reflètent pas un choix)."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("""SELECT status, COUNT(*) FROM actions
+                     WHERE user_id=? AND action_type=? AND priority=? AND requires_approval=1
+                       AND status IN ('executed','rejected')
+                     GROUP BY status""", (user_id, action_type, priority))
+        counts = dict(c.fetchall()); conn.close()
+        approved = counts.get('executed', 0)
+        rejected = counts.get('rejected', 0)
+        return approved, rejected
+
+    def record_word_feedback(self, user_id, words, category, positive):
+        """Renforce (positive=True) ou affaiblit (positive=False) le poids d'un
+        ensemble de mots pour une catégorie donnée ('urgency' ou 'emotion:xxx'),
+        suite à une décision réelle de l'utilisateur (approve/reject)."""
+        if not words: return
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        col = 'pos' if positive else 'neg'
+        for w in words:
+            c.execute(f"""INSERT INTO word_feedback (user_id, word, category, {col})
+                          VALUES (?,?,?,1)
+                          ON CONFLICT(user_id, word, category)
+                          DO UPDATE SET {col} = {col} + 1""", (user_id, w, category))
+        conn.commit(); conn.close()
+
+    def get_word_weights(self, user_id, category):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT word, pos, neg FROM word_feedback WHERE user_id=? AND category=?", (user_id, category))
+        r = c.fetchall(); conn.close()
+        return {w: (pos, neg) for w, pos, neg in r}
+
+    def record_precursor_outcome(self, user_id, signature_words, action_type, hit):
+        """Enregistre qu'un signal avec ce jeu de mots significatifs a mené à ce
+        type d'action, et si l'utilisateur l'a validée (hit=True) ou non. La
+        signature est stockée comme chaîne triée pour être réutilisable comme clé."""
+        if not signature_words: return
+        signature = ",".join(sorted(signature_words))[:500]
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("""INSERT INTO precursor_patterns (user_id, signature, action_type, occurrences, hits, last_seen)
+                     VALUES (?,?,?,1,?,?)
+                     ON CONFLICT(user_id, signature, action_type)
+                     DO UPDATE SET occurrences = occurrences + 1, hits = hits + excluded.hits, last_seen = excluded.last_seen""",
+                  (user_id, signature, action_type, 1 if hit else 0, datetime.now().isoformat()))
+        conn.commit(); conn.close()
+
+    def get_precursor_patterns(self, user_id, min_occurrences=3):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("""SELECT signature, action_type, occurrences, hits FROM precursor_patterns
+                     WHERE user_id=? AND occurrences>=?""", (user_id, min_occurrences))
+        r = c.fetchall(); conn.close()
+        return [{'words': set(sig.split(",")) if sig else set(), 'action_type': at,
+                  'occurrences': occ, 'hits': hits} for sig, at, occ, hits in r]
+
 
 # ============================================================
 # MOTEUR DE CONTEXTE
@@ -450,6 +585,9 @@ class ContextEngine:
         self._update_profile_from_signal(signal); self._save_profile()
 
     def _extract_urgency(self, signal):
+        # Base statique : liste de mots-clés figée, sert de point de départ à
+        # froid (aucun historique nécessaire) mais casse sur les synonymes et
+        # les formulations imprévues ("pas de panique, mais...").
         markers = {'high': ['urgent','asap','deadline','emergency','critical','immediately',"aujourd'hui",'demain','ce soir','ce matin'],
                    'medium': ['bientôt','prochainement','cette semaine','dans les jours'],
                    'low': ['quand tu peux','pas pressé','pas urgent','à ta convenance']}
@@ -460,9 +598,22 @@ class ContextEngine:
             if w in cl: score += 0.2
         for w in markers['low']:
             if w in cl: score -= 0.3
+
+        # Lexique adaptatif : ajuste le score avec des mots que CE utilisateur a,
+        # par ses propres approbations/rejets passés, associés à de l'urgence
+        # réelle — même si ces mots n'apparaissent dans aucune liste statique.
+        # Poids = log-odds lissé, borné pour qu'un seul mot ne domine pas le score.
+        learned = self.db.get_word_weights(self.user_id, 'urgency')
+        if learned:
+            for w in tokenize(signal.content):
+                if w in learned:
+                    pos, neg = learned[w]
+                    weight = (pos - neg) / (pos + neg + 3)  # lissage : proche de 0 tant que peu de preuves
+                    score += max(-0.3, min(0.3, weight))
+
         if signal.metadata.get('deadline'):
             try:
-                dl = datetime.fromisoformat(signal.metadata['deadline'])
+                dl = parse_iso_naive(signal.metadata['deadline'])
                 hu = (dl - signal.timestamp).total_seconds() / 3600
                 if hu < 24: score += 0.5
                 elif hu < 72: score += 0.3
@@ -470,14 +621,43 @@ class ContextEngine:
             except: pass
         return min(1.0, max(0.0, score))
 
+    _NEGATION_WORDS = ['rien', 'pas', 'aucun', 'aucune', 'sans', 'jamais', 'ni']
+
+    def _negated_before(self, text_lower, keyword, window_chars=20):
+        """Vrai si un mot de négation précède ce mot-clé de près (ex: 'rien
+        d'urgent'). Naïf par nature (fenêtre de caractères, pas d'analyse
+        syntaxique réelle), mais couvre les formulations les plus courantes
+        sans faux positifs constatés dans les tests."""
+        for m in re.finditer(re.escape(keyword), text_lower):
+            start = max(0, m.start() - window_chars)
+            preceding = text_lower[start:m.start()]
+            if any(re.search(r'\b' + re.escape(neg) + r'\b', preceding) for neg in self._NEGATION_WORDS):
+                return True
+        return False
+
     def _extract_emotion(self, signal):
         cl = signal.content.lower()
         em = {'stressed': ['stress','débordé','overwhelmed','panique','anxieux','urgent'],
               'frustrated': ['énervé','frustré','inacceptable','ridicule','problème'],
               'excited': ['super','génial','excellent','opportunité','gagnant'],
               'sad': ['désolé','triste','difficile','perdu','abandonné']}
-        sc = {k: sum(1 for w in v if w in cl) for k, v in em.items()}
-        if max(sc.values()) == 0: return 'neutral'
+        # Un mot-clé précédé d'une négation ('rien d'urgent', 'aucun problème')
+        # ne doit pas compter — sinon un email qui dit explicitement qu'il n'y
+        # a PAS de stress finit par déclencher une action de gestion du stress.
+        sc = {k: float(sum(1 for w in v if w in cl and not self._negated_before(cl, w))) for k, v in em.items()}
+
+        # Même principe que pour l'urgence : des mots appris spécifiques à cet
+        # utilisateur peuvent renforcer une émotion sans figurer dans la liste statique.
+        tokens = tokenize(signal.content)
+        for emotion in em:
+            learned = self.db.get_word_weights(self.user_id, f'emotion:{emotion}')
+            if not learned: continue
+            for w in tokens:
+                if w in learned:
+                    pos, neg = learned[w]
+                    sc[emotion] += max(-0.5, min(0.5, (pos - neg) / (pos + neg + 3)))
+
+        if max(sc.values()) <= 0: return 'neutral'
         return max(sc, key=sc.get)
 
     def _update_profile_from_signal(self, signal):
@@ -519,7 +699,7 @@ class ContextEngine:
         for x in r:
             try:
                 m = json.loads(x[0])
-                if m.get('deadline') and datetime.fromisoformat(m['deadline']) > datetime.now(): n += 1
+                if m.get('deadline') and parse_iso_naive(m['deadline']) > datetime.now(): n += 1
             except: pass
         return n
 
@@ -534,11 +714,14 @@ class ContextEngine:
 # MOTEUR DE PRÉDICTION
 # ============================================================
 
+MIN_CALIBRATION_SAMPLES = 5  # en dessous de ce nombre de décisions passées, on garde le prior par défaut
+
 class PredictionEngine:
     def __init__(self, context_engine):
         self.context = context_engine
         self.prediction_history = []
         self.accuracy_log = []
+        self.anticipation = AnticipationEngine(context_engine)
 
     def generate_predictions(self, horizon_hours=24):
         p = []
@@ -547,7 +730,24 @@ class PredictionEngine:
         p.extend(self._predict_wellbeing_actions())
         p.extend(self._predict_opportunity_actions())
         p.extend(self._predict_habit_based_actions())
+        # Anticipation par motifs : signaux qui ressemblent à des précurseurs
+        # historiques, même sans mot-clé/deadline explicite. Voir AnticipationEngine.
+        p.extend(self.anticipation.predict(rule_based_so_far=p))
         return self._filter_and_score(p)
+
+    def _confidence(self, action_type, priority, default, reasoning_chain):
+        """Renvoie une confiance calibrée sur l'historique réel d'approbation de
+        CET utilisateur pour ce (type d'action, priorité), avec repli explicite
+        sur le prior par défaut quand il n'y a pas encore assez de décisions
+        passées (cold start honnête plutôt que chiffre inventé)."""
+        approved, rejected = self.context.db.get_approval_stats(self.context.user_id, action_type.value, priority.name)
+        total = approved + rejected
+        if total >= MIN_CALIBRATION_SAMPLES:
+            calibrated = (approved + 1) / (total + 2)  # lissage de Laplace, prior neutre 0.5
+            reasoning_chain.append(f"Confiance calibrée sur {total} décisions passées similaires ({approved} approuvées, {rejected} rejetées)")
+            return round(calibrated, 2)
+        reasoning_chain.append(f"Confiance par défaut — seulement {total} décision(s) passée(s) similaire(s), pas assez pour calibrer")
+        return default
 
     def _predict_deadline_actions(self):
         p = []; now = datetime.now()
@@ -559,15 +759,19 @@ class PredictionEngine:
             try:
                 m = json.loads(x[3])
                 if not m.get('deadline'): continue
-                dl = datetime.fromisoformat(m['deadline'])
+                dl = parse_iso_naive(m['deadline'])
                 hu = (dl - now).total_seconds() / 3600
                 s = ContextSignal(source=x[0],content=x[1],timestamp=datetime.fromisoformat(x[2]),metadata=m,emotional_tone=x[4],urgency_indicator=x[5])
                 if 0 < hu < 4:
-                    a = NexusAction(action_id=self._gen_id(),action_type=ActionType.REMINDER_SET,description=f"URGENT: Deadline dans {int(hu)}h — {s.content[:80]}...",target_context={'deadline':m['deadline']},confidence=0.95,priority=Priority.CRITICAL,reasoning_chain=[f"Deadline: {m['deadline']}",f"Temps restant: {int(hu)}h","Action: Rappel immédiat"])
-                    p.append(PredictedNeed(self._gen_id(),f"Gestion urgente: {s.content[:60]}",now,timedelta(hours=1),0.95,[s.source],a))
+                    rc = [f"Deadline: {m['deadline']}",f"Temps restant: {int(hu)}h","Action: Rappel immédiat"]
+                    conf = self._confidence(ActionType.REMINDER_SET, Priority.CRITICAL, 0.95, rc)
+                    a = NexusAction(action_id=self._gen_id(),action_type=ActionType.REMINDER_SET,description=f"URGENT: Deadline dans {int(hu)}h — {s.content[:80]}...",target_context={'deadline':m['deadline'],'trigger_text':s.content},confidence=conf,priority=Priority.CRITICAL,reasoning_chain=rc)
+                    p.append(PredictedNeed(self._gen_id(),f"Gestion urgente: {s.content[:60]}",now,timedelta(hours=1),conf,[s.source],a))
                 elif 4 <= hu < 24:
-                    a = NexusAction(action_id=self._gen_id(),action_type=ActionType.TASK_CREATE,description=f"Planifier: {s.content[:80]}... (deadline dans {int(hu)}h)",target_context={'deadline':m['deadline']},confidence=0.85,priority=Priority.HIGH,reasoning_chain=[f"Deadline dans {int(hu)}h","Action: Création de tâche"])
-                    p.append(PredictedNeed(self._gen_id(),f"Planification: {s.content[:60]}",now,timedelta(hours=4),0.85,[s.source],a))
+                    rc = [f"Deadline dans {int(hu)}h","Action: Création de tâche"]
+                    conf = self._confidence(ActionType.TASK_CREATE, Priority.HIGH, 0.85, rc)
+                    a = NexusAction(action_id=self._gen_id(),action_type=ActionType.TASK_CREATE,description=f"Planifier: {s.content[:80]}... (deadline dans {int(hu)}h)",target_context={'deadline':m['deadline'],'trigger_text':s.content},confidence=conf,priority=Priority.HIGH,reasoning_chain=rc)
+                    p.append(PredictedNeed(self._gen_id(),f"Planification: {s.content[:60]}",now,timedelta(hours=4),conf,[s.source],a))
             except: pass
         return p
 
@@ -582,8 +786,11 @@ class PredictionEngine:
                 latest = max(signals, key=lambda x: x.timestamp)
                 hs = (now - latest.timestamp).total_seconds() / 3600
                 if hs > 6:
-                    a = NexusAction(action_id=self._gen_id(),action_type=ActionType.EMAIL_DRAFT,description=f"Brouillon réponse à {sender} ({len(signals)} messages non traités)",target_context={'sender':sender,'count':len(signals)},confidence=0.75,priority=Priority.HIGH,reasoning_chain=[f"{len(signals)} messages de {sender}",f"Dernier il y a {int(hs)}h","Action: Brouillon de réponse"])
-                    p.append(PredictedNeed(self._gen_id(),f"Réponse attendue par {sender}",now,timedelta(hours=2),0.75,[s.source for s in signals],a))
+                    rc = [f"{len(signals)} messages de {sender}",f"Dernier il y a {int(hs)}h","Action: Brouillon de réponse"]
+                    conf = self._confidence(ActionType.EMAIL_DRAFT, Priority.HIGH, 0.75, rc)
+                    trigger_text = " | ".join(sg.content for sg in signals[-3:])
+                    a = NexusAction(action_id=self._gen_id(),action_type=ActionType.EMAIL_DRAFT,description=f"Brouillon réponse à {sender} ({len(signals)} messages non traités)",target_context={'sender':sender,'count':len(signals),'trigger_text':trigger_text},confidence=conf,priority=Priority.HIGH,reasoning_chain=rc)
+                    p.append(PredictedNeed(self._gen_id(),f"Réponse attendue par {sender}",now,timedelta(hours=2),conf,[s.source for s in signals],a))
         return p
 
     def _predict_wellbeing_actions(self):
@@ -591,8 +798,11 @@ class PredictionEngine:
         recent = self.context.get_recent_signals(hours=6)
         stress = [s for s in recent if s.emotional_tone == 'stressed']
         if len(stress) >= 2:
-            a = NexusAction(action_id=self._gen_id(),action_type=ActionType.FOCUS_BLOCK,description="Bloc de focus recommandé — stress élevé détecté",target_context={'stress_count':len(stress)},confidence=0.80,priority=Priority.HIGH,reasoning_chain=[f"{len(stress)} signaux de stress","Charge cognitive élevée","Action: Bloc de focus 25min"])
-            p.append(PredictedNeed(self._gen_id(),"Gestion du stress — pause",now,timedelta(minutes=30),0.80,[s.source for s in stress],a))
+            rc = [f"{len(stress)} signaux de stress","Charge cognitive élevée","Action: Bloc de focus 25min"]
+            conf = self._confidence(ActionType.FOCUS_BLOCK, Priority.HIGH, 0.80, rc)
+            trigger_text = " | ".join(sg.content for sg in stress[-3:])
+            a = NexusAction(action_id=self._gen_id(),action_type=ActionType.FOCUS_BLOCK,description="Bloc de focus recommandé — stress élevé détecté",target_context={'stress_count':len(stress),'trigger_text':trigger_text},confidence=conf,priority=Priority.HIGH,reasoning_chain=rc)
+            p.append(PredictedNeed(self._gen_id(),"Gestion du stress — pause",now,timedelta(minutes=30),conf,[s.source for s in stress],a))
         if len(recent) > 30:
             a = NexusAction(action_id=self._gen_id(),action_type=ActionType.INFO_DIGEST,description=f"Digest d'information — {len(recent)} signaux en 6h",target_context={'count':len(recent)},confidence=0.70,priority=Priority.MEDIUM,reasoning_chain=[f"{len(recent)} signaux en 6h","Surcharge informationnelle","Action: Synthèse auto"],auto_executable=True,requires_approval=False)
             p.append(PredictedNeed(self._gen_id(),"Digest — surcharge",now,timedelta(minutes=15),0.70,[s.source for s in recent[:5]],a))
@@ -603,8 +813,10 @@ class PredictionEngine:
         kw = ['opportunité','opportunity','offre','offer','promotion','invitation','partenariat','partnership','collaboration','nouveau projet','new project']
         for s in self.context.get_recent_signals(hours=48):
             if any(w in s.content.lower() for w in kw) and s.urgency_indicator and s.urgency_indicator > 0.3:
-                a = NexusAction(action_id=self._gen_id(),action_type=ActionType.DECISION_PROMPT,description=f"Opportunité: {s.content[:100]}...",target_context={'content':s.content[:200]},confidence=0.65,priority=Priority.MEDIUM,reasoning_chain=["Mot-clé opportunité",f"Urgence: {s.urgency_indicator}","Action: Prompt décision"])
-                p.append(PredictedNeed(self._gen_id(),f"Opportunité: {s.content[:60]}",now,timedelta(hours=12),0.65,[s.source],a))
+                rc = ["Mot-clé opportunité",f"Urgence: {s.urgency_indicator}","Action: Prompt décision"]
+                conf = self._confidence(ActionType.DECISION_PROMPT, Priority.MEDIUM, 0.65, rc)
+                a = NexusAction(action_id=self._gen_id(),action_type=ActionType.DECISION_PROMPT,description=f"Opportunité: {s.content[:100]}...",target_context={'content':s.content[:200],'trigger_text':s.content},confidence=conf,priority=Priority.MEDIUM,reasoning_chain=rc)
+                p.append(PredictedNeed(self._gen_id(),f"Opportunité: {s.content[:60]}",now,timedelta(hours=12),conf,[s.source],a))
         return p
 
     def _predict_habit_based_actions(self):
@@ -613,8 +825,10 @@ class PredictionEngine:
         if ch in ph:
             b = [s for s in self.context.get_recent_signals(hours=1) if s.source == 'browsing' and any(w in s.content.lower() for w in ['youtube','reddit','twitter','instagram','facebook'])]
             if len(b) > 5:
-                a = NexusAction(action_id=self._gen_id(),action_type=ActionType.FOCUS_BLOCK,description="Heure de productivité — redirection suggérée",target_context={'hour':ch,'distractions':len(b)},confidence=0.60,priority=Priority.LOW,reasoning_chain=[f"Heure productive: {ch}h",f"{len(b)} distractions","Action: Focus block"])
-                p.append(PredictedNeed(self._gen_id(),"Redirection productivité",now,timedelta(minutes=15),0.60,[s.source for s in b],a))
+                rc = [f"Heure productive: {ch}h",f"{len(b)} distractions","Action: Focus block"]
+                conf = self._confidence(ActionType.FOCUS_BLOCK, Priority.LOW, 0.60, rc)
+                a = NexusAction(action_id=self._gen_id(),action_type=ActionType.FOCUS_BLOCK,description="Heure de productivité — redirection suggérée",target_context={'hour':ch,'distractions':len(b)},confidence=conf,priority=Priority.LOW,reasoning_chain=rc)
+                p.append(PredictedNeed(self._gen_id(),"Redirection productivité",now,timedelta(minutes=15),conf,[s.source for s in b],a))
         return p
 
     def _filter_and_score(self, predictions):
@@ -632,10 +846,90 @@ class PredictionEngine:
 
 
 # ============================================================
+# MOTEUR D'ANTICIPATION — motifs précurseurs appris de l'historique
+# ============================================================
+# Ce que ce moteur fait réellement : il compare le vocabulaire d'un nouveau
+# signal aux "signatures" de mots qui, par le passé, ont précédé une action
+# que CET utilisateur a validée. Si le recouvrement est suffisant ET que le
+# motif a déjà été observé plusieurs fois avec un taux d'approbation correct,
+# il propose l'action AVANT qu'un mot-clé explicite (deadline, "urgent", etc.)
+# n'apparaisse. C'est une vraie généralisation lexicale (similarité d'ensembles
+# de mots, pas correspondance exacte) — mais elle reste bornée par l'historique
+# réel de l'utilisateur : sans preuve accumulée (occurrences >= seuil), rien ne
+# se déclenche. Ce n'est pas de la compréhension sémantique, c'est de la
+# reconnaissance de motifs récurrents, honnêtement scorée par sa propre preuve.
+
+MIN_PATTERN_EVIDENCE = 3      # nombre minimum d'occurrences passées avant de faire confiance à un motif
+MIN_PATTERN_SIMILARITY = 0.35  # recouvrement de Jaccard minimum avec un motif connu
+MIN_PATTERN_HIT_RATE = 0.5     # taux d'approbation historique minimum du motif
+
+class AnticipationEngine:
+    def __init__(self, context_engine):
+        self.context = context_engine
+
+    def predict(self, rule_based_so_far=None, hours=12):
+        already_covered = {s for pred in (rule_based_so_far or []) for s in pred.source_signals}
+        patterns = self.context.db.get_precursor_patterns(self.context.user_id, min_occurrences=MIN_PATTERN_EVIDENCE)
+        if not patterns:
+            return []  # pas d'historique -> pas d'anticipation. Cold start honnête, pas de magie.
+
+        p = []; now = datetime.now()
+        recent = self.context.get_recent_signals(hours=hours)
+        for s in recent:
+            sig_words = tokenize(s.content)
+            if not sig_words:
+                continue
+            best = None
+            for pat in patterns:
+                sim = jaccard(sig_words, pat['words'])
+                if sim < MIN_PATTERN_SIMILARITY:
+                    continue
+                hit_rate = pat['hits'] / pat['occurrences']
+                if hit_rate < MIN_PATTERN_HIT_RATE:
+                    continue
+                score = sim * hit_rate
+                if best is None or score > best[0]:
+                    best = (score, sim, hit_rate, pat)
+            if not best:
+                continue
+            score, sim, hit_rate, pat = best
+            try:
+                action_type = ActionType(pat['action_type'])
+            except ValueError:
+                continue
+            confidence = round(0.25 + 0.5 * hit_rate * sim, 2)  # volontairement plus prudent qu'une règle explicite
+            priority = Priority.MEDIUM if hit_rate >= 0.7 else Priority.LOW
+            rc = [
+                f"Aucun mot-clé explicite détecté — signal similaire à un motif passé ({int(sim*100)}% de recouvrement lexical)",
+                f"Ce motif a précédé une action « {action_type.value} » {pat['occurrences']} fois, approuvée {pat['hits']} fois ({int(hit_rate*100)}%)",
+                "Anticipation fondée sur ton historique, pas sur un mot-clé de la liste statique",
+            ]
+            a = NexusAction(
+                action_id=hashlib.md5(f"{now.isoformat()}{random.random()}".encode()).hexdigest()[:12],
+                action_type=action_type,
+                description=f"Anticipé (motif reconnu) : {s.content[:80]}...",
+                target_context={'trigger_text': s.content, 'anticipated': True, 'similarity': round(sim, 2)},
+                confidence=confidence, priority=priority, reasoning_chain=rc,
+            )
+            p.append(PredictedNeed(
+                hashlib.md5(f"{now.isoformat()}{random.random()}anticip".encode()).hexdigest()[:12],
+                f"Anticipation motif: {s.content[:60]}", now, timedelta(hours=6), confidence, [s.source], a,
+            ))
+        return p
+
+
+# ============================================================
 # MOTEUR D'ACTION
 # ============================================================
 
 class ActionEngine:
+    # Catégorie de lexique adaptatif à nourrir selon le type d'action approuvée/rejetée.
+    _WORD_FEEDBACK_CATEGORY = {
+        ActionType.REMINDER_SET: 'urgency',
+        ActionType.TASK_CREATE: 'urgency',
+        ActionType.FOCUS_BLOCK: 'emotion:stressed',
+    }
+
     def __init__(self, context_engine, prediction_engine, db):
         self.context = context_engine; self.predictor = prediction_engine; self.db = db
         self.pending_approvals = []; self.executed_actions = []
@@ -653,7 +947,30 @@ class ActionEngine:
         action.status = "executed"; action.executed_at = datetime.now()
         self.db.update_action_status(action.action_id, "executed", action.executed_at)
         self.executed_actions.append(action)
+        self._learn_from_feedback(action.action_type, action.target_context, approved=True)
         return {'status':'executed','action_id':action.action_id}
+
+    def _learn_from_feedback(self, action_type, target_context, approved):
+        """Point d'entrée unique de la boucle d'apprentissage : appelé après
+        CHAQUE décision humaine (approbation ou rejet), qu'elle vienne d'une
+        action encore en mémoire ou retrouvée en base après redémarrage.
+        Alimente à la fois le lexique adaptatif (mots -> urgence/émotion) et
+        les motifs précurseurs (l'anticipation de AnticipationEngine)."""
+        target_context = target_context or {}
+        trigger_text = target_context.get('trigger_text', '')
+        if not trigger_text:
+            return
+        words = tokenize(trigger_text)
+        if not words:
+            return
+        category = self._WORD_FEEDBACK_CATEGORY.get(action_type)
+        if category:
+            self.db.record_word_feedback(self.context.user_id, words, category, positive=approved)
+        # Un motif précurseur se construit indépendamment du type d'action :
+        # même chose qui n'alimente pas le lexique (ex: EMAIL_DRAFT) peut
+        # néanmoins devenir un motif reconnu par AnticipationEngine.
+        significant = list(words)[:8]  # signature bornée pour rester comparable
+        self.db.record_precursor_outcome(self.context.user_id, significant, action_type.value, hit=approved)
 
     def approve_action(self, action_id):
         for a in self.pending_approvals:
@@ -662,12 +979,16 @@ class ActionEngine:
         # Pas en mémoire (ex: après redémarrage) : vérifier que l'action existe
         # vraiment en base, appartient à cet utilisateur, et est encore en attente,
         # avant de la marquer comme exécutée.
-        status = self.db.get_action(self.context.user_id, action_id)
-        if status is None:
+        full = self.db.get_action_full(self.context.user_id, action_id)
+        if full is None:
             return {'status': 'not_found', 'action_id': action_id}
-        if status != 'pending':
-            return {'status': 'error', 'message': f"action déjà '{status}', ne peut pas être approuvée", 'action_id': action_id}
+        if full['status'] != 'pending':
+            return {'status': 'error', 'message': f"action déjà '{full['status']}', ne peut pas être approuvée", 'action_id': action_id}
         self.db.update_action_status(action_id, "executed", datetime.now())
+        try:
+            self._learn_from_feedback(ActionType(full['action_type']), full['target_context'], approved=True)
+        except ValueError:
+            pass
         return {'status': 'executed', 'action_id': action_id}
 
     def reject_action(self, action_id, reason=""):
@@ -676,13 +997,18 @@ class ActionEngine:
                 a.status = "rejected"; self.pending_approvals.remove(a)
                 self.db.update_action_status(action_id, "rejected")
                 self.predictor.accuracy_log.append({'action_id':action_id,'outcome':'rejected','reason':reason,'timestamp':datetime.now()})
+                self._learn_from_feedback(a.action_type, a.target_context, approved=False)
                 return {'status':'rejected'}
-        status = self.db.get_action(self.context.user_id, action_id)
-        if status is None:
+        full = self.db.get_action_full(self.context.user_id, action_id)
+        if full is None:
             return {'status': 'not_found', 'action_id': action_id}
-        if status != 'pending':
-            return {'status': 'error', 'message': f"action déjà '{status}', ne peut pas être rejetée", 'action_id': action_id}
+        if full['status'] != 'pending':
+            return {'status': 'error', 'message': f"action déjà '{full['status']}', ne peut pas être rejetée", 'action_id': action_id}
         self.db.update_action_status(action_id, "rejected")
+        try:
+            self._learn_from_feedback(ActionType(full['action_type']), full['target_context'], approved=False)
+        except ValueError:
+            pass
         return {'status': 'rejected', 'action_id': action_id}
 
     def get_pending_actions(self):

@@ -365,5 +365,73 @@ class TestRateLimiter:
         assert rl.check("k")[0] is True
 
 
+# ------------------------------------------------------------------
+# Calibration de confiance, lexique adaptatif, moteur d'anticipation
+# ------------------------------------------------------------------
+
+class TestLearningLoop:
+
+    def test_confidence_drops_after_repeated_rejections(self, nexus):
+        confidences = []
+        for i in range(8):
+            nexus.ingest("email", f"URGENT deadline test {i}",
+                         {"deadline": (datetime.now() + timedelta(hours=2)).isoformat()})
+            nexus.run_cycle()
+            crit = [a for a in nexus.action_engine.get_pending_actions()
+                    if a.priority == nx.Priority.CRITICAL]
+            if crit:
+                confidences.append(crit[0].confidence)
+                nexus.reject(crit[0].action_id)
+        assert len(confidences) >= 6
+        assert confidences[-1] < confidences[0]
+
+    def test_confidence_stays_default_below_sample_threshold(self, nexus):
+        nexus.ingest("email", "URGENT deadline unique",
+                     {"deadline": (datetime.now() + timedelta(hours=2)).isoformat()})
+        nexus.run_cycle()
+        crit = [a for a in nexus.action_engine.get_pending_actions()
+                if a.priority == nx.Priority.CRITICAL]
+        assert crit and crit[0].confidence == 0.95  # prior par défaut, pas assez d'historique
+
+    def test_adaptive_lexicon_learns_novel_word(self, nexus):
+        word = "zorblex"  # absent de toute liste statique de mots-clés
+        before = nexus.context_engine._extract_urgency(
+            nx.ContextSignal(source="email", content=f"petit mot {word}", timestamp=datetime.now(), metadata={}))
+        for i in range(6):
+            nexus.ingest("email", f"rapport {word} numero {i}",
+                         {"deadline": (datetime.now() + timedelta(hours=2)).isoformat()})
+            nexus.run_cycle()
+            pending = nexus.action_engine.get_pending_actions()
+            if pending:
+                nexus.approve(pending[0].action_id)
+        after = nexus.context_engine._extract_urgency(
+            nx.ContextSignal(source="email", content=f"petit mot {word}", timestamp=datetime.now(), metadata={}))
+        assert after > before
+
+    def test_no_anticipation_without_history(self, nexus):
+        nexus.ingest("messaging", "le client parle du contrat sans mot-clé urgent")
+        nexus.run_cycle()
+        anticipated = [a for a in nexus.action_engine.get_pending_actions()
+                       if a.target_context.get('anticipated')]
+        assert anticipated == []
+
+    def test_anticipation_fires_on_similar_signal_after_evidence(self, nexus):
+        for i in range(4):
+            nexus.ingest("email", f"URGENT client mecontent facture impayee dossier {i}",
+                         {"deadline": (datetime.now() + timedelta(hours=2)).isoformat()})
+            nexus.run_cycle()
+            pending = [a for a in nexus.action_engine.get_pending_actions()
+                       if not a.target_context.get('anticipated')]
+            if pending:
+                nexus.approve(pending[0].action_id)
+        # Signal similaire, mais sans "URGENT" ni deadline explicite.
+        nexus.ingest("messaging", "client mecontent facture impayee nouveau dossier")
+        nexus.run_cycle()
+        anticipated = [a for a in nexus.action_engine.get_pending_actions()
+                       if a.target_context.get('anticipated')]
+        assert anticipated
+        assert anticipated[0].confidence < 0.7  # l'anticipation reste volontairement prudente
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
