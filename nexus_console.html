@@ -517,6 +517,10 @@
   }
 
   async function runCycle() {
+    const btn = el("btnCycle");
+    btn.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = "Cycle en cours…";
     try {
       const data = await apiCall("/api/v1/cycle", { method: "POST", body: {} });
       const r = data.cycle_result || {};
@@ -524,6 +528,9 @@
       refreshDashboard();
     } catch (e) {
       showMsg("cycleMsg", e.message, false);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
     }
   }
 

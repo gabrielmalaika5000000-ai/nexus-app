@@ -426,6 +426,24 @@ class NexusDatabase:
                    action.status, None, datetime.now().isoformat()))
         conn.commit(); conn.close()
 
+    def has_similar_pending(self, user_id, action_type, description):
+        """
+        Empêche d'enregistrer deux fois la même décision en attente — utile
+        si un cycle est déclenché deux fois de suite (double-tap mobile,
+        requête réseau relancée, plusieurs onglets ouverts). On compare le
+        type d'action ET la description exacte : deux décisions du même
+        type mais avec un contenu différent (ex: deux emails différents)
+        restent bien deux décisions distinctes.
+        """
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM actions WHERE user_id=? AND action_type=? AND description=? AND status='pending' LIMIT 1",
+            (user_id, action_type.value, description),
+        )
+        r = c.fetchone(); conn.close()
+        return r is not None
+
     def get_action(self, user_id, action_id):
         """Retourne (status) de l'action si elle appartient bien à cet utilisateur, sinon None."""
         conn = sqlite3.connect(self.db_path)
@@ -937,6 +955,8 @@ class ActionEngine:
     def process_predictions(self, predictions):
         for pred in predictions:
             a = pred.suggested_action
+            if self.db.has_similar_pending(self.context.user_id, a.action_type, a.description):
+                continue  # déjà une décision identique en attente — pas de doublon
             self.db.save_action(self.context.user_id, a)
             if a.auto_executable and not a.requires_approval:
                 self._execute(a)
